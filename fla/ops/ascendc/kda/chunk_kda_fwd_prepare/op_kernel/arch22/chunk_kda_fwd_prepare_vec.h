@@ -291,7 +291,7 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(inputReady_[pair]);
         if (args_.tiling.inputSequenceMajor) {
             static_assert(Arch22Ub::kGLast + Shape::kChunkRows * sizeof(uint32_t) <= Arch22Ub::kPrivateBytes,
-                          "beta offsets exceed private UB slot");
+                          "diagnostic offsets exceed private UB slot");
             auto offsetsInt = ub[base + Arch22Ub::kGLast].template ReinterpretCast<int32_t>();
             AscendC::CreateVecIndex(offsetsInt, static_cast<int32_t>(0), Shape::kChunkRows);
             AscendC::PipeBarrier<PIPE_V>();
@@ -1008,8 +1008,8 @@ private:
         constexpr float clampMax = Domain::StoredBound(base2Max);
         // 共享 scratch 8 KiB 切成两块 8 行 FP32：factor 存参考行差值取指后的
         // 指数因子，stage 存 BF16 输入展开的 FP32 落位。
-        // 每块使用 8 行 FP32 scratch；sequence-major 的 beta gather 偏移
-        // 在独立私有区按需重建，不占用这里的 scratch。
+        // 注意 scratch 末尾 0x1F00 起是 sequence-major 场景的 beta gather
+        // 偏移表，本 Stage 只使用前 7 KiB，因此每块最多 7 行 FP32。
         constexpr uint32_t kTileRows = 8;
         constexpr uint32_t kTileElems = kTileRows * Shape::kHeadDim;
         auto factor = scratch;
@@ -1100,17 +1100,29 @@ private:
             const uint32_t blockEnd = blockEnds[s];
             const uint32_t midpoint = (blockBegin + blockEnd) / 2;
             for (uint32_t rowBegin = blockBegin; rowBegin < blockEnd;) {
-                // Full chunks only: G rows before this block are dead.
-                // A 16-row FP32 factor is placed in G rows 16-31 or 24-39;
-                // the current block midpoint and future rows stay intact.
-                const bool useWideTile = validRows == Shape::kChunkRows && rowBegin >= 32;
+                // Full chunks, first two 16-row blocks: all Kminus values
+                // have already consumed G. Copy the block midpoint bitwise
+                // before reusing the current G block as the FP32 factor.
+                // Wait for any preceding Cast reading scratch before copying
+                // the reference; the existing barrier after Sub then makes
+                // the reference storage available for the 16-row stage.
+                const bool useEarlyWide = validRows == Shape::kChunkRows && rowBegin < 32;
+                const bool useWideTile = validRows == Shape::kChunkRows;
                 const uint32_t rows = useWideTile ? 16U :
                     (blockEnd - rowBegin < kTileRows ? blockEnd - rowBegin : kTileRows);
-                auto factorTile = useWideTile ? g[rowBegin * Shape::kHeadDim / 2] : factor;
+                auto factorTile = useEarlyWide ? g[rowBegin * Shape::kHeadDim] :
+                    (useWideTile ? g[rowBegin * Shape::kHeadDim / 2] : factor);
                 auto stageTile = useWideTile ? scratch : stage;
                 const uint32_t elems = rows * Shape::kHeadDim;
+                if (useEarlyWide) {
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Copy(scratch, g[midpoint * Shape::kHeadDim],
+                                  uint64_t(64), 2, {1, 1, 8, 8});
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+                auto reference = useEarlyWide ? scratch : g[midpoint * Shape::kHeadDim];
                 SubTileMinusRow(factorTile, g[rowBegin * Shape::kHeadDim],
-                                g[midpoint * Shape::kHeadDim], rows);
+                                reference, rows);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Maxs(factorTile, factorTile, clampMin, elems);
                 AscendC::PipeBarrier<PIPE_V>();
@@ -1404,23 +1416,32 @@ private:
             Domain::StoredBound(ExpDomain::kV6UpperBase2);
         // 同样的公式按整块（8 行）下发，逐行只影响行列步长参数，
         // 数学与舍入顺序与逐行版本完全一致。
-        // 与 V1 相同：每块使用 8 行 FP32 scratch；beta gather 偏移
-        // 在独立私有区按需重建。
+        // 与 V1 相同：共享 scratch 前 7 KiB 可用（0x1F00 起是 beta gather
+        // 偏移表），因此每块 7 行 FP32。
         constexpr uint32_t kTileRows = 8;
         constexpr uint32_t kTileElems = kTileRows * Shape::kHeadDim;
         auto factor = scratch;
         auto stage = scratch[kTileElems];
         for (uint32_t rowBegin = 0; rowBegin < validRows;) {
-            // Full chunks only: once at least 32 G rows are consumed,
-            // borrow the current qgScaled destination for FP32 factor.
-            // Its last V read precedes the BF16 overwrite below.
-            const bool useWideTile = validRows == Shape::kChunkRows &&
-                rowBegin >= 32;
+            // Full chunks, first 32 rows: borrow the not-yet-written high
+            // half of kBetaG for the FP32 factor. Current BF16 outputs are in
+            // its low half and do not overlap. For the remaining rows use the
+            // already-consumed G area, as in the original wide path.
+            // The existing barriers finish factor reads before its reuse;
+            // outputReady_/ioFree_ continue to protect the private slot.
+            static_assert(Shape::kChunkRows == 64 && Shape::kHeadDim == 128);
+            static_assert(Arch22Ub::kV6KBetaG +
+                              Shape::kChunkRows * Shape::kHeadDim * sizeof(bfloat16_t)
+                          <= Arch22Ub::kPrivateBytes);
+            const bool isFullChunk = validRows == Shape::kChunkRows;
+            const bool useEarlyWide = isFullChunk && rowBegin < 32;
+            const bool useWideTile = isFullChunk;
             const uint32_t rows = useWideTile ? 16U :
                 (validRows - rowBegin < kTileRows
                      ? validRows - rowBegin : kTileRows);
-            auto factorTile = useWideTile
-                ? g[rowBegin * Shape::kHeadDim / 2] : factor;
+            auto factorTile = useEarlyWide
+                ? kBetaG[32 * Shape::kHeadDim].template ReinterpretCast<float>()
+                : (useWideTile ? g[rowBegin * Shape::kHeadDim / 2] : factor);
             auto stageTile = useWideTile ? scratch : stage;
             const uint32_t elems = rows * Shape::kHeadDim;
             const uint32_t offset = rowBegin * Shape::kHeadDim;
