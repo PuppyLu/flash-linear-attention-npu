@@ -85,6 +85,28 @@ public:
         if (chunkWorkItems < context_.aicCoreNum && context_.qkHeadNum > 1) {
             headsPerPartition = context_.valueHeadNum / context_.qkHeadNum;
             partitionCount = context_.qkHeadNum;
+        } else if (context_.workspaceSlotBytes ==
+                       CHUNK_KDA_FWD_PREPARE_ARCH22_SLOT_BYTES &&
+                   chunkWorkItems >= context_.aicCoreNum &&
+                   chunkWorkItems % context_.aicCoreNum != 0 &&
+                   context_.valueHeadNum >
+                       CHUNK_KDA_FWD_PREPARE_SLOTS_PER_WORKGROUP &&
+                   context_.valueHeadNum <=
+                       std::numeric_limits<uint32_t>::max()) {
+            // 四个 head 同组时不能跨 GVA QK-head 所属的完整 value 组。
+            // 仅在分组数和总任务数可表达时启用，否则退回原 chunk 调度。
+            constexpr uint64_t group =
+                CHUNK_KDA_FWD_PREPARE_SLOTS_PER_WORKGROUP;
+            const uint64_t valuesPerQk =
+                context_.valueHeadNum / context_.qkHeadNum;
+            const uint64_t groups = context_.valueHeadNum / group +
+                (context_.valueHeadNum % group != 0);
+            if (valuesPerQk != 0 && group % valuesPerQk == 0 &&
+                groups <= std::numeric_limits<uint32_t>::max() /
+                              chunkWorkItems) {
+                headsPerPartition = group;
+                partitionCount = groups;
+            }
         }
 
         uint64_t totalWorkItems = 0;

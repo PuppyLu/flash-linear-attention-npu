@@ -51,8 +51,8 @@ bool CheckChunkOnlySchedule()
         2, 4, 8, 16, 0, 24, 1024, false};
     optiling::ChunkKdaFwdPrepareSchedule schedule;
     return optiling::ChunkKdaFwdPrepareTilingProcessor(context).Process(schedule) &&
-        schedule.chunkWorkItems == 32 && schedule.totalWorkItems == 32 &&
-        schedule.usedCoreNum == 24 && schedule.headsPerPartition == 8 &&
+        schedule.chunkWorkItems == 32 && schedule.totalWorkItems == 64 &&
+        schedule.usedCoreNum == 24 && schedule.headsPerPartition == 4 &&
         schedule.workspaceBytes ==
             1024 + 24 *
                 optiling::CHUNK_KDA_FWD_PREPARE_ARCH22_WORKGROUP_BYTES;
@@ -95,8 +95,8 @@ bool CheckVarLenSchedule()
         1, 3, 12, 0, 7, 6, 4096, true};
     optiling::ChunkKdaFwdPrepareSchedule schedule;
     return optiling::ChunkKdaFwdPrepareTilingProcessor(context).Process(schedule) &&
-        schedule.chunkWorkItems == 7 && schedule.totalWorkItems == 7 &&
-        schedule.usedCoreNum == 6 && schedule.headsPerPartition == 12;
+        schedule.chunkWorkItems == 7 && schedule.totalWorkItems == 21 &&
+        schedule.usedCoreNum == 6 && schedule.headsPerPartition == 4;
 }
 
 bool CheckInvalidGva()
@@ -125,6 +125,39 @@ bool CheckHeadPartitionWorkItemOverflow()
     return !optiling::ChunkKdaFwdPrepareTilingProcessor(context).Process(schedule);
 }
 
+bool CheckArch22TailBalance()
+{
+    using namespace optiling;
+    auto process = [](const ChunkKdaFwdPrepareScheduleContext &c,
+                      uint64_t work, uint32_t heads, uint32_t cores) {
+        ChunkKdaFwdPrepareSchedule s;
+        return ChunkKdaFwdPrepareTilingProcessor(c).Process(s) &&
+               s.totalWorkItems == work && s.headsPerPartition == heads &&
+               s.usedCoreNum == cores;
+    };
+    ChunkKdaFwdPrepareScheduleContext c{1, 96, 96, 64, 0, 20, 0, false};
+    if (!process(c, 1536, 4, 20)) return false; // dense
+    c.isVarLen = true; c.totalVarLenChunks = 64;
+    if (!process(c, 1536, 4, 20)) return false; // varlen
+    c.isVarLen = false; c.chunksPerSequence = 60;
+    if (!process(c, 60, 96, 20)) return false; // full waves
+    c.chunksPerSequence = 64; c.qkHeadNum = 32;
+    if (!process(c, 64, 96, 20)) return false; // GVA group 3
+    c.qkHeadNum = 24;
+    if (!process(c, 1536, 4, 20)) return false; // GVA group 4
+    c.qkHeadNum = 7; c.valueHeadNum = 7;
+    if (!process(c, 128, 4, 20)) return false; // final 3 heads
+    c.qkHeadNum = 96; c.valueHeadNum = 96;
+    c.workspaceSlotBytes = CHUNK_KDA_FWD_PREPARE_ARCH35_SLOT_BYTES;
+    if (!process(c, 64, 96, 20)) return false; // arch35 unchanged
+    c.workspaceSlotBytes = CHUNK_KDA_FWD_PREPARE_ARCH22_SLOT_BYTES;
+    c.isVarLen = true;
+    c.totalVarLenChunks = std::numeric_limits<uint32_t>::max();
+    if (!process(c, std::numeric_limits<uint32_t>::max(), 96, 20))
+        return false; // partition overflow falls back
+    return true;
+}
+
 } // namespace
 
 int main()
@@ -135,7 +168,8 @@ int main()
                    CheckGvaHeadSplitSchedule() &&
                    CheckVarLenSchedule() && CheckInvalidGva() &&
                    CheckChunkWorkItemOverflow() &&
-                   CheckHeadPartitionWorkItemOverflow()
+                   CheckHeadPartitionWorkItemOverflow() &&
+                   CheckArch22TailBalance()
                ? 0
                : 1;
 }

@@ -73,15 +73,6 @@ public:
         // 基础 API 能看到占用状态；注释给出 CANN 9.1 分配器的预期返回值。
         scalarRead_ = pipe_->AllocEventID<AscendC::HardEvent::V_S>(); // ID 0
         scalarWrite_ = pipe_->AllocEventID<AscendC::HardEvent::S_V>(); // ID 0
-        if (args_.tiling.inputSequenceMajor) {
-            auto offsets = ubBuf_.Get<uint8_t>()[Arch22Ub::kBetaGatherOffsets]
-                               .template ReinterpretCast<uint32_t>();
-            for (uint32_t row = 0; row < Shape::kChunkRows; ++row) {
-                offsets.SetValue(row, row * 32U);
-            }
-            AscendC::SetFlag<AscendC::HardEvent::S_V>(scalarWrite_);
-            AscendC::WaitFlag<AscendC::HardEvent::S_V>(scalarWrite_);
-        }
         sharedFree_ = pipe_->AllocEventID<AscendC::HardEvent::V_MTE2>(); // ID 0
         // 两个 pair 分时复用共享 G/scratch；初始许可只发布一次。
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(sharedFree_);
@@ -299,8 +290,14 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(inputReady_[pair]);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(inputReady_[pair]);
         if (args_.tiling.inputSequenceMajor) {
-            auto offsets = ub[Arch22Ub::kBetaGatherOffsets]
-                               .template ReinterpretCast<uint32_t>();
+            static_assert(Arch22Ub::kGLast + Shape::kChunkRows * sizeof(uint32_t) <= Arch22Ub::kPrivateBytes,
+                          "beta offsets exceed private UB slot");
+            auto offsetsInt = ub[base + Arch22Ub::kGLast].template ReinterpretCast<int32_t>();
+            AscendC::CreateVecIndex(offsetsInt, static_cast<int32_t>(0), Shape::kChunkRows);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(offsetsInt, offsetsInt, static_cast<int32_t>(32), Shape::kChunkRows);
+            AscendC::PipeBarrier<PIPE_V>();
+            auto offsets = offsetsInt.template ReinterpretCast<uint32_t>();
             AscendC::Gather(beta, betaStrided, offsets,
                             static_cast<uint32_t>(0), chunk.validRows);
             AscendC::PipeBarrier<PIPE_V>();
@@ -414,6 +411,15 @@ private:
         auto b = ub[base + Arch22Ub::kV3B].template ReinterpretCast<float>();
         auto x0 = ub[base + Arch22Ub::kV3X0].template ReinterpretCast<float>();
         auto x1 = ub[base + Arch22Ub::kV3X1].template ReinterpretCast<float>();
+        static_assert(Arch22Ub::kV3X1 == Arch22Ub::kV3X0 + 4096);
+        static_assert(Arch22Ub::kV3NegX1 == Arch22Ub::kV3X0 + 8192);
+        static_assert(Arch22Ub::kV3NegX1 + 0x7000 == Arch22Ub::kPrivateBytes);
+        auto packedBytes = ub[base + Arch22Ub::kV3X0];
+        packedBytes.SetSize(8192);
+        auto packedLeaves = packedBytes.template ReinterpretCast<float>();
+        auto scratchBytes = ub[base + Arch22Ub::kV3NegX1];
+        scratchBytes.SetSize(0x7000);
+        auto solveScratch = scratchBytes.template ReinterpretCast<float>();
         auto negX1 = ub[base + Arch22Ub::kV3NegX1].template ReinterpretCast<float>();
         auto betaEff = ub[Arch22Ub::kV3BetaEff].template ReinterpretCast<float>();
         auto akkPack = ub[base + Arch22Ub::kV3AkkPack]
@@ -454,7 +460,7 @@ private:
         // Leaf0 区在 V3 内不被其它 buffer 使用，借给 Gather 的偏移表。
         auto coeffOffsetInt =
             ub[base + Arch22Ub::kV3Leaf0].template ReinterpretCast<int32_t>();
-        V3Vf(raw, betaEff, aqk, lkk, b, x0, x1, negX1, akkPack,
+        V3Vf(raw, betaEff, aqk, lkk, b, x0, x1, packedLeaves, solveScratch, negX1, akkPack,
              coeffOffsetInt, chunk.validRows, args_.tiling.scale);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(sharedFree_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(outputReady_[pair]);
@@ -496,7 +502,9 @@ private:
             AscendC::GlobalTensor<float> payload;
             payload.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(
                 args_.workspace + slot + Workspace::kPayload));
-            AscendC::DataCopy(payload[Workspace::kX0 / sizeof(float)], x0, 1024);
+            auto x0Output = chunk.validRows == Shape::kChunkRows
+                ? coeffOffsetInt.template ReinterpretCast<float>() : x0;
+            AscendC::DataCopy(payload[Workspace::kX0 / sizeof(float)], x0Output, 1024);
             AscendC::DataCopy(payload[Workspace::kNegX1 / sizeof(float)], negX1, 1024);
             AscendC::DataCopy(payload[Workspace::kB / sizeof(float)], b, 1024);
         }
@@ -526,9 +534,11 @@ private:
         qhat.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.workspace + slot + Workspace::kQHat));
         khat.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(args_.workspace + slot + Workspace::kKHat));
         betaContext.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(args_.workspace + slot + Workspace::kBetaEff));
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(sharedFree_);
+        // These destinations are pair-private; ioFree_ above protects their
+        // reuse.  Start the loads before waiting for the shared G buffer.
         AscendC::DataCopy(qg, qhat, chunk.validRows * Shape::kHeadDim);
         AscendC::DataCopy(kg, khat, chunk.validRows * Shape::kHeadDim);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(sharedFree_);
         AscendC::DataCopyPadExtParams<float> pad{false, 0, 0, 0};
         AscendC::DataCopyPad(betaEff, betaContext,
             AscendC::DataCopyExtParams{
@@ -641,11 +651,9 @@ private:
         AscendC::LocalTensor<float> dstTile,
         AscendC::LocalTensor<float> rowScalars, uint32_t rows)
     {
-        for (uint8_t block = 0; block < 8; ++block) {
-            AscendC::DataCopy(dstTile[8 * block], rowScalars,
-                              AscendC::DataCopyParams(
-                                  static_cast<uint16_t>(rows), 1, 0, 7));
-        }
+        // Each source row contains eight copies of the same scalar. Brcb
+        // expands each copy into a block, making 64 lanes for that row.
+        AscendC::Brcb(dstTile, rowScalars, static_cast<uint8_t>(rows), {1, 8});
     }
 
     __aicore__ inline void MulTileByRowScalars(
@@ -662,40 +670,131 @@ private:
                      {1, 1, 1, rowStride, rowStride, 8});
     }
 
-    // 单位下三角逆的右看消元：对 leafRows 阶单位下三角块求 X=(I+L)^-1。
-    // 每轮需要“L 的第 k 列按行复制成 4 个 block”的系数张量。这里用带元素
-    // 偏移的 Gather 直接从 lkk 取：dst 的第 j 行 32 个 lane 全取
-    // lkk[lkkBase + (k+1+j)*rowStride + k]，等价于该列复制 4 个 block，
-    // 一条指令替代原来的 1 次 DataCopy + 1 次 Brcb + 4 次 DataCopy。
-    // 偏移张量与 k 无关（只随行变化），k 由 srcBaseAddr 吸收。
-    __aicore__ inline void SolveLeafRightLooking(
-        AscendC::LocalTensor<float> x, AscendC::LocalTensor<float> lkk,
-        AscendC::LocalTensor<uint32_t> coeffOffset,
-        AscendC::LocalTensor<float> coeffTile,
-        AscendC::LocalTensor<float> prod, uint32_t leafRows, uint32_t lkkBase,
+    // 独立叶块逐轮交错，保持每个叶的计算顺序并共用屏障。
+    __aicore__ inline void SolveLeavesRightLooking(
+        AscendC::LocalTensor<float> x0, AscendC::LocalTensor<float> x1,
+        AscendC::LocalTensor<float> lkk, AscendC::LocalTensor<uint32_t> offsets,
+        AscendC::LocalTensor<float> raw, AscendC::LocalTensor<float> negX1, uint32_t topRows, uint32_t bottomRows,
         uint32_t rowStride)
     {
-        constexpr uint32_t kLeaf = 32;
-        constexpr uint8_t kLeafRepStride =
-            static_cast<uint8_t>(kLeaf * sizeof(float) / 32);
-        for (uint32_t k = 0; k + 1 < leafRows; ++k) {
-            const uint32_t rows = leafRows - k - 1;
-            // (k+1+j)*rowStride + k = (lkkBase + (rowStride+1)*k) + rowStride*(j+1)
-            const uint32_t baseElems = lkkBase + (rowStride + 1) * k;
-            AscendC::Gather(coeffTile, lkk, coeffOffset,
-                            static_cast<uint32_t>(baseElems * sizeof(float)),
-                            rows * kLeaf);
+        constexpr uint32_t n = 32, tile = n * n;
+        constexpr uint8_t stride = n * sizeof(float) / 32;
+        auto coeff0 = raw;
+        auto coeff1 = raw[tile];
+        auto prod0 = raw[2 * tile];
+        auto prod1 = raw[3 * tile];
+        auto next0 = negX1;
+        auto next1 = raw[4 * tile];
+        const uint32_t maxRows = topRows > bottomRows ? topRows : bottomRows;
+        if (topRows > 1) AscendC::Gather(coeff0, lkk, offsets, 0, (topRows-1)*n);
+        if (bottomRows > 1) AscendC::Gather(coeff1, lkk, offsets, n*(rowStride+1)*sizeof(float), (bottomRows-1)*n);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t k = 0; k + 1 < maxRows; ++k) {
+            const bool top = k+1 < topRows, bottom = k+1 < bottomRows;
+            const bool topNext = k+2 < topRows, bottomNext = k+2 < bottomRows;
+            const uint32_t nextBase = (rowStride+1)*(k+1);
+            if ((k & 1U) == 0) {
+                if (top) AscendC::Mul(prod0, x0[k*n], coeff0, n, static_cast<uint8_t>(topRows-k-1), {1,1,1,stride,0,stride});
+                if (bottom) AscendC::Mul(prod1, x1[k*n], coeff1, n, static_cast<uint8_t>(bottomRows-k-1), {1,1,1,stride,0,stride});
+                if (topNext) AscendC::Gather(next0, lkk, offsets, nextBase*sizeof(float), (topRows-k-2)*n);
+                if (bottomNext) AscendC::Gather(next1, lkk, offsets, (n*rowStride+n+nextBase)*sizeof(float), (bottomRows-k-2)*n);
+            } else {
+                if (top) AscendC::Mul(prod0, x0[k*n], next0, n, static_cast<uint8_t>(topRows-k-1), {1,1,1,stride,0,stride});
+                if (bottom) AscendC::Mul(prod1, x1[k*n], next1, n, static_cast<uint8_t>(bottomRows-k-1), {1,1,1,stride,0,stride});
+                if (topNext) AscendC::Gather(coeff0, lkk, offsets, nextBase*sizeof(float), (topRows-k-2)*n);
+                if (bottomNext) AscendC::Gather(coeff1, lkk, offsets, (n*rowStride+n+nextBase)*sizeof(float), (bottomRows-k-2)*n);
+            }
             AscendC::PipeBarrier<PIPE_V>();
-            // src0 用 repStride=0 反复读取 X[k,:]，src1 是逐行不同的系数，
-            // dst 是 k 以下各行。
-            AscendC::Mul(prod, x[k * kLeaf], coeffTile, kLeaf,
-                         static_cast<uint8_t>(rows),
-                         {1, 1, 1, kLeafRepStride, 0, kLeafRepStride});
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Sub(x[(k + 1) * kLeaf], x[(k + 1) * kLeaf], prod,
-                         static_cast<int32_t>(rows * kLeaf));
+            if (top) AscendC::Sub(x0[(k+1)*n], x0[(k+1)*n], prod0, static_cast<int32_t>((topRows-k-1)*n));
+            if (bottom) AscendC::Sub(x1[(k+1)*n], x1[(k+1)*n], prod1, static_cast<int32_t>((bottomRows-k-1)*n));
             AscendC::PipeBarrier<PIPE_V>();
         }
+    }
+
+    // Packed-leaf prototype for a complete chunk: preserve the original k order
+    // and FP32 Mul/Sub rounding while issuing each operation for both leaves.
+    // x0 and x1 are adjacent 4 KiB regions and are packed temporarily as
+    // 32 rows of [32 top-leaf values, 32 bottom-leaf values].
+    __aicore__ inline void SolvePackedLeavesFull(
+        AscendC::LocalTensor<float> x0, AscendC::LocalTensor<float> x1,
+        AscendC::LocalTensor<float> lkk, AscendC::LocalTensor<int32_t> offsets,
+        AscendC::LocalTensor<float> scratch, AscendC::LocalTensor<float> packed)
+    {
+        constexpr uint32_t n = 32;
+        constexpr uint32_t packedWidth = 64;
+        constexpr uint32_t coeffLanes = (n - 1) * packedWidth;
+        constexpr uint32_t scalarCount = (n - 1) * 8;
+        constexpr uint32_t rowStride = Shape::kChunkRows;
+        constexpr uint32_t bottomBase = n * rowStride + n;
+        auto rowTmp = scratch.template ReinterpretCast<int32_t>();
+        auto laneTmp = scratch[coeffLanes].template ReinterpretCast<int32_t>();
+
+        // x0 begins at 0x9000 and x1 at 0xa000: both form one 8 KiB bank.
+        AscendC::Duplicate(packed, 0.0F, n * packedWidth);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t lane = 0; lane < 8; ++lane) {
+            uint64_t mask[2] = {(1ULL << lane) | (1ULL << (32 + lane)), 0};
+            AscendC::Duplicate(packed[lane * packedWidth], 1.0F, mask, 4, 1, 65);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // Eight scalar lanes per row: four copies each of the two leaf
+        // coefficients. Brcb expands each scalar into one 32-byte block.
+        AscendC::CreateVecIndex(offsets, 0, scalarCount);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::ShiftRight(rowTmp, offsets, 3, scalarCount);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::ShiftRight(offsets, offsets, 2, scalarCount);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(laneTmp, rowTmp, 2, scalarCount);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sub(offsets, offsets, laneTmp, scalarCount);
+        AscendC::Adds(rowTmp, rowTmp, 1, scalarCount);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(offsets, offsets, static_cast<int32_t>(bottomBase * sizeof(float)), scalarCount);
+        AscendC::Muls(rowTmp, rowTmp, static_cast<int32_t>(rowStride * sizeof(float)), scalarCount);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(offsets, offsets, rowTmp, scalarCount);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        auto gatherOffsets = offsets.template ReinterpretCast<uint32_t>();
+        auto coeff0 = scratch;
+        auto coeff1 = scratch[coeffLanes];
+        auto product = scratch[2 * coeffLanes];
+        // This 992-byte staging region ends below the 28 KiB workspace limit.
+        auto scalars = scratch[3 * coeffLanes];
+        static_assert((3 * coeffLanes + scalarCount) * sizeof(float) <= 0x7000);
+        AscendC::Gather(scalars, lkk, gatherOffsets, 0, scalarCount);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Brcb(coeff0, scalars, static_cast<uint8_t>(n - 1), {1, 8});
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t k = 0; k + 1 < n; ++k) {
+            const uint32_t rows = n - k - 1;
+            auto current = (k & 1U) == 0 ? coeff0 : coeff1;
+            auto next = (k & 1U) == 0 ? coeff1 : coeff0;
+            AscendC::Mul(product, packed[k * packedWidth], current, packedWidth,
+                         static_cast<uint8_t>(rows), {1, 1, 1, 8, 0, 8});
+            if (rows > 1) {
+                const uint32_t nextBase = (rowStride + 1) * (k + 1);
+                AscendC::Gather(scalars, lkk, gatherOffsets,
+                                nextBase * sizeof(float), (rows - 1) * 8);
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Sub(packed[(k + 1) * packedWidth], packed[(k + 1) * packedWidth],
+                         product, static_cast<int32_t>(rows * packedWidth));
+            if (rows > 1) {
+                AscendC::Brcb(next, scalars, static_cast<uint8_t>(rows - 1), {1, 8});
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
+        // Gather offsets are dead: use that 8 KiB region as the final
+        // contiguous leaf outputs, without copying them back over packed.
+        auto top = offsets.template ReinterpretCast<float>();
+        auto bottom = top[n * n];
+        AscendC::Copy(top, packed, n, n, {1, 1, 4, 8});
+        AscendC::Copy(bottom, packed[n], n, n, {1, 1, 4, 8});
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void V0Vf(
@@ -909,9 +1008,9 @@ private:
         constexpr float clampMax = Domain::StoredBound(base2Max);
         // 共享 scratch 8 KiB 切成两块 8 行 FP32：factor 存参考行差值取指后的
         // 指数因子，stage 存 BF16 输入展开的 FP32 落位。
-        // 注意 scratch 末尾 0x1F00 起是 sequence-major 场景的 beta gather
-        // 偏移表，本 Stage 只使用前 7 KiB，因此每块最多 7 行 FP32。
-        constexpr uint32_t kTileRows = 7;
+        // 每块使用 8 行 FP32 scratch；sequence-major 的 beta gather 偏移
+        // 在独立私有区按需重建，不占用这里的 scratch。
+        constexpr uint32_t kTileRows = 8;
         constexpr uint32_t kTileElems = kTileRows * Shape::kHeadDim;
         auto factor = scratch;
         auto stage = scratch[kTileElems];
@@ -925,13 +1024,17 @@ private:
 
         // Kplus 与 Khat 原位复用，所以必须先生成完四个 Kminus 前缀。
         // 否则后一个参考块会错误读取已经舍入成 Kplus 的数据。
-        for (uint32_t s = 0; s < Shape::kSubChunkCount; ++s) {
-            auto kMinusBlock = kMinus[
-                (Arch22Ub::kKMinus[s] - Arch22Ub::kGateOrKMinus) /
-                sizeof(bfloat16_t)];
-            AscendC::Duplicate(kMinusBlock, static_cast<bfloat16_t>(0),
-                               Shape::kPrefixRows[s] * Shape::kHeadDim);
-            AscendC::PipeBarrier<PIPE_V>();
+        // Full chunks write all four Kminus prefixes before StageC2 reads them.
+        // Incomplete chunks still need zero padding for inactive rows/bands.
+        if (validRows != Shape::kChunkRows) {
+            for (uint32_t s = 0; s < Shape::kSubChunkCount; ++s) {
+                auto kMinusBlock = kMinus[
+                    (Arch22Ub::kKMinus[s] - Arch22Ub::kGateOrKMinus) /
+                    sizeof(bfloat16_t)];
+                AscendC::Duplicate(kMinusBlock, static_cast<bfloat16_t>(0),
+                                   Shape::kPrefixRows[s] * Shape::kHeadDim);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
         }
         // Kminus 前缀整体按 8 行一块下发：参考行差值用行广播指令生成，
         // 之后 clamp/缩放/Exp/Cast/Mul/Cast 全部是整块指令。
@@ -944,34 +1047,49 @@ private:
             // 半开区间 [begin,end) 的中点取 floor((begin+end)/2)。
             const uint32_t midpoint = (blockBegin + blockEnd) / 2;
             const uint32_t prefix = blockEnd;
-            for (uint32_t rowBegin = 0; rowBegin < prefix;
-                 rowBegin += kTileRows) {
-                const uint32_t rows = prefix - rowBegin < kTileRows
-                                          ? prefix - rowBegin
-                                          : kTileRows;
+            for (uint32_t rowBegin = 0; rowBegin < prefix;) {
+                // Full chunks only: factor can borrow the current BF16
+                // Kminus output plus future, not-yet-written rows.
+                // The final 16 rows of s=3 cannot borrow beyond the
+                // private slot, so keep the existing 8-row fallback.
+                const bool useWideTile = validRows == Shape::kChunkRows &&
+                    (s < 3 || rowBegin < 48);
+                const uint32_t rows = useWideTile ? 16U :
+                    (prefix - rowBegin < kTileRows
+                         ? prefix - rowBegin : kTileRows);
+                auto factorTile = useWideTile
+                    ? kMinusBlock[rowBegin * Shape::kHeadDim]
+                          .template ReinterpretCast<float>()
+                    : factor;
+                auto stageTile = useWideTile ? scratch : stage;
                 const uint32_t elems = rows * Shape::kHeadDim;
-                SubRowMinusTile(factor, g[midpoint * Shape::kHeadDim],
+                SubRowMinusTile(factorTile, g[midpoint * Shape::kHeadDim],
                                 g[rowBegin * Shape::kHeadDim], rows);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Maxs(factor, factor, clampMin, elems);
+                AscendC::Maxs(factorTile, factorTile, clampMin, elems);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mins(factor, factor, clampMax, elems);
+                AscendC::Mins(factorTile, factorTile, clampMax, elems);
                 AscendC::PipeBarrier<PIPE_V>();
                 if constexpr (Domain::useExp2) {
-                    AscendC::Muls(factor, factor, Domain::expInputScale,
+                    AscendC::Muls(factorTile, factorTile, Domain::expInputScale,
                                   elems);
                     AscendC::PipeBarrier<PIPE_V>();
                 }
-                AscendC::Exp(factor, factor, elems);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Cast(stage, kHat[rowBegin * Shape::kHeadDim],
+                AscendC::Exp(factorTile, factorTile, elems);
+                AscendC::Cast(stageTile, kHat[rowBegin * Shape::kHeadDim],
                               AscendC::RoundMode::CAST_NONE, elems);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mul(stage, stage, factor, elems);
+                AscendC::Mul(stageTile, stageTile, factorTile, elems);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Cast(kMinusBlock[rowBegin * Shape::kHeadDim], stage,
+                AscendC::Cast(kMinusBlock[rowBegin * Shape::kHeadDim], stageTile,
                               AscendC::RoundMode::CAST_RINT, elems);
-                AscendC::PipeBarrier<PIPE_V>();
+                // The wide→narrow transition reuses scratch factor while the
+                // wide Cast still reads it. Other next Sub operations use a
+                // disjoint factor; their existing PIPE_V waits for this Cast.
+                if (useWideTile && s == 3 && rowBegin == 32) {
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+                rowBegin += rows;
             }
         }
 
@@ -981,43 +1099,48 @@ private:
             const uint32_t blockBegin = s * Shape::kSubChunkRows;
             const uint32_t blockEnd = blockEnds[s];
             const uint32_t midpoint = (blockBegin + blockEnd) / 2;
-            for (uint32_t rowBegin = blockBegin; rowBegin < blockEnd;
-                 rowBegin += kTileRows) {
-                const uint32_t rows = blockEnd - rowBegin < kTileRows
-                                          ? blockEnd - rowBegin
-                                          : kTileRows;
+            for (uint32_t rowBegin = blockBegin; rowBegin < blockEnd;) {
+                // Full chunks only: G rows before this block are dead.
+                // A 16-row FP32 factor is placed in G rows 16-31 or 24-39;
+                // the current block midpoint and future rows stay intact.
+                const bool useWideTile = validRows == Shape::kChunkRows && rowBegin >= 32;
+                const uint32_t rows = useWideTile ? 16U :
+                    (blockEnd - rowBegin < kTileRows ? blockEnd - rowBegin : kTileRows);
+                auto factorTile = useWideTile ? g[rowBegin * Shape::kHeadDim / 2] : factor;
+                auto stageTile = useWideTile ? scratch : stage;
                 const uint32_t elems = rows * Shape::kHeadDim;
-                SubTileMinusRow(factor, g[rowBegin * Shape::kHeadDim],
+                SubTileMinusRow(factorTile, g[rowBegin * Shape::kHeadDim],
                                 g[midpoint * Shape::kHeadDim], rows);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Maxs(factor, factor, clampMin, elems);
+                AscendC::Maxs(factorTile, factorTile, clampMin, elems);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mins(factor, factor, clampMax, elems);
+                AscendC::Mins(factorTile, factorTile, clampMax, elems);
                 AscendC::PipeBarrier<PIPE_V>();
                 // SIMD 侧统一调用自然 Exp；log2 域显式换算，ln 域直接计算。
                 if constexpr (Domain::useExp2) {
-                    AscendC::Muls(factor, factor, Domain::expInputScale,
+                    AscendC::Muls(factorTile, factorTile, Domain::expInputScale,
                                   elems);
                     AscendC::PipeBarrier<PIPE_V>();
                 }
-                AscendC::Exp(factor, factor, elems);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Cast(stage, qHat[rowBegin * Shape::kHeadDim],
+                AscendC::Exp(factorTile, factorTile, elems);
+                AscendC::Cast(stageTile, qHat[rowBegin * Shape::kHeadDim],
                               AscendC::RoundMode::CAST_NONE, elems);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mul(stage, stage, factor, elems);
+                AscendC::Mul(stageTile, stageTile, factorTile, elems);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Cast(qPlus[rowBegin * Shape::kHeadDim], stage,
+                AscendC::Cast(qPlus[rowBegin * Shape::kHeadDim], stageTile,
                               AscendC::RoundMode::CAST_RINT, elems);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Cast(stage, kHat[rowBegin * Shape::kHeadDim],
+                AscendC::Cast(stageTile, kHat[rowBegin * Shape::kHeadDim],
                               AscendC::RoundMode::CAST_NONE, elems);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mul(stage, stage, factor, elems);
+                AscendC::Mul(stageTile, stageTile, factorTile, elems);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Cast(kPlus[rowBegin * Shape::kHeadDim], stage,
+                AscendC::Cast(kPlus[rowBegin * Shape::kHeadDim], stageTile,
                               AscendC::RoundMode::CAST_RINT, elems);
-                AscendC::PipeBarrier<PIPE_V>();
+                // The next Sub writes disjoint factor scratch and retains its
+                // PIPE_V; the caller's events cover the final pending Cast.
+                rowBegin += rows;
             }
         }
     }
@@ -1027,7 +1150,8 @@ private:
         AscendC::LocalTensor<bfloat16_t> aqk,
         AscendC::LocalTensor<float> lkk,
         AscendC::LocalTensor<float> b, AscendC::LocalTensor<float> x0,
-        AscendC::LocalTensor<float> x1, AscendC::LocalTensor<float> negX1,
+        AscendC::LocalTensor<float> x1, AscendC::LocalTensor<float> packedLeaves,
+        AscendC::LocalTensor<float> solveScratch, AscendC::LocalTensor<float> negX1,
         AscendC::LocalTensor<bfloat16_t> akkPack,
         AscendC::LocalTensor<int32_t> coeffOffsetInt, uint32_t validRows,
         float scale)
@@ -1050,19 +1174,49 @@ private:
                                   Shape::kSubChunkRows * s * (s + 1);
             AscendC::Muls(raw[band], raw[band], scale,
                           bandRows * Shape::kPrefixRows[s]);
-            AscendC::PipeBarrier<PIPE_V>();
         }
-        for (uint32_t globalRow = 0; globalRow < validRows; ++globalRow) {
-            const uint32_t s = globalRow / Shape::kSubChunkRows;
-            const uint32_t row = globalRow % Shape::kSubChunkRows;
+        // Bands occupy disjoint raw ranges. The mask initialization barrier
+        // below also completes all scales before any of the casts.
+        // Full 16-row prefix bands can be cast in one repeat instruction.
+        // Reinterpret the 512-byte coefficient-offset scratch as a BF16 bit
+        // mask before the scratch is reused to build the Gather offsets.
+        // Only the 16x16 diagonal sub-block needs causal masking; earlier
+        // sub-blocks are fully visible and later sub-blocks remain zero.
+        auto triangleMask = coeffOffsetInt.template ReinterpretCast<uint16_t>();
+        auto aqkBits = aqk.template ReinterpretCast<uint16_t>();
+        AscendC::Duplicate(triangleMask, static_cast<uint16_t>(0), 16 * 16);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t row = 0; row < 16; ++row) {
+            AscendC::Duplicate(triangleMask[row * 16], static_cast<uint16_t>(0xffff), row + 1);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t s = 0; s < activeBands; ++s) {
+            const uint32_t remaining = validRows - s * Shape::kSubChunkRows;
+            const uint32_t rows = remaining < Shape::kSubChunkRows
+                                      ? remaining : Shape::kSubChunkRows;
             const uint32_t n = Shape::kPrefixRows[s];
             const uint32_t stackedBand = Shape::kSubChunkRows *
                                          Shape::kSubChunkRows * s * (s + 1);
-            auto rawAqk = raw[stackedBand + row * n];
-            const uint32_t aqkCount = globalRow + 1;
-            AscendC::Cast(aqk[globalRow * Shape::kChunkRows], rawAqk,
-                          AscendC::RoundMode::CAST_RINT, aqkCount);
+            const uint32_t firstRow = s * Shape::kSubChunkRows;
+            // FP32 source stride n/8 and BF16 destination stride 4 blocks.
+            AscendC::Cast(aqk[firstRow * Shape::kChunkRows], raw[stackedBand],
+                          AscendC::RoundMode::CAST_RINT, n, static_cast<uint8_t>(rows),
+                          {1, 1, 4, static_cast<uint8_t>(n / 8)});
         }
+        // Cast bands write disjoint destination rows. All casts must finish
+        // before the diagonal mask starts reading those destinations.
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t s = 0; s < activeBands; ++s) {
+            const uint32_t remaining = validRows - s * Shape::kSubChunkRows;
+            const uint32_t rows = remaining < Shape::kSubChunkRows
+                                      ? remaining : Shape::kSubChunkRows;
+            const uint32_t firstRow = s * Shape::kSubChunkRows;
+            const uint32_t diagonal = firstRow * Shape::kChunkRows + firstRow;
+            AscendC::And(aqkBits[diagonal], aqkBits[diagonal], triangleMask,
+                         16, static_cast<uint8_t>(rows), {1, 1, 1, 4, 4, 1});
+        }
+        // Finish all mask reads before coeffOffsetInt is reused for Gather.
+        AscendC::PipeBarrier<PIPE_V>();
 
         const uint32_t topRows = validRows < 32 ? validRows : 32;
         // beta 的逐行标量只读一次（一次 V->S 同步）；下面的逐行 Muls 读写区间
@@ -1142,83 +1296,83 @@ private:
 
         AscendC::PipeBarrier<PIPE_V>();
         // I+Lkk=[[A00,0],[B,A11]]；在同一次 VF 中求两个 32 阶单位下三角逆。
-        AscendC::Duplicate(x0, 0.0F, 1024);
-        AscendC::Duplicate(x1, 0.0F, 1024);
-        AscendC::PipeBarrier<PIPE_V>();
         const uint32_t bottomRows = validRows > 32 ? validRows - 32 : 0;
-        // FP32 向量指令要求 UB 首地址按 32 Byte 对齐，不能直接从
-        // x[row, row] 发起长度为 1 的 Duplicate。按对角元素在 32 Byte
-        // block 内的 lane 分组：同一 lane 相邻两个对角元素跨 8 行，
-        // repeat stride 为 8 * 4 + 1 = 33 个 block。
-        constexpr uint32_t kFp32PerBlock = 8;
-        constexpr uint16_t kDiagonalBlockStride = 1;
-        constexpr uint8_t kDiagonalRepeatStride = 33;
-        const uint32_t topDiagonalLanes =
-            topRows < kFp32PerBlock ? topRows : kFp32PerBlock;
-        for (uint32_t lane = 0; lane < topDiagonalLanes; ++lane) {
-            uint64_t diagonalMask[2] = {1ULL << lane, 0};
-            const uint8_t repeat = static_cast<uint8_t>(
-                CeilDiv(topRows - lane, kFp32PerBlock));
-            AscendC::Duplicate(x0[lane * 32], 1.0F, diagonalMask, repeat,
-                               kDiagonalBlockStride, kDiagonalRepeatStride);
+        if (validRows == Shape::kChunkRows) {
+            SolvePackedLeavesFull(x0, x1, lkk, coeffOffsetInt, solveScratch, packedLeaves);
+        } else {
+            AscendC::Duplicate(x0, 0.0F, 1024);
+            AscendC::Duplicate(x1, 0.0F, 1024);
+            AscendC::PipeBarrier<PIPE_V>();
+            // FP32 向量指令要求 UB 首地址按 32 Byte 对齐，不能直接从
+            // x[row, row] 发起长度为 1 的 Duplicate。按对角元素在 32 Byte
+            // block 内的 lane 分组：同一 lane 相邻两个对角元素跨 8 行，
+            // repeat stride 为 8 * 4 + 1 = 33 个 block。
+            constexpr uint32_t kFp32PerBlock = 8;
+            constexpr uint16_t kDiagonalBlockStride = 1;
+            constexpr uint8_t kDiagonalRepeatStride = 33;
+            const uint32_t topDiagonalLanes =
+                topRows < kFp32PerBlock ? topRows : kFp32PerBlock;
+            for (uint32_t lane = 0; lane < topDiagonalLanes; ++lane) {
+                uint64_t diagonalMask[2] = {1ULL << lane, 0};
+                const uint8_t repeat = static_cast<uint8_t>(
+                    CeilDiv(topRows - lane, kFp32PerBlock));
+                AscendC::Duplicate(x0[lane * 32], 1.0F, diagonalMask, repeat,
+                                   kDiagonalBlockStride, kDiagonalRepeatStride);
+            }
+            const uint32_t bottomDiagonalLanes =
+                bottomRows < kFp32PerBlock ? bottomRows : kFp32PerBlock;
+            for (uint32_t lane = 0; lane < bottomDiagonalLanes; ++lane) {
+                uint64_t diagonalMask[2] = {1ULL << lane, 0};
+                const uint8_t repeat = static_cast<uint8_t>(
+                    CeilDiv(bottomRows - lane, kFp32PerBlock));
+                AscendC::Duplicate(x1[lane * 32], 1.0F, diagonalMask, repeat,
+                                   kDiagonalBlockStride, kDiagonalRepeatStride);
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+            // 单位下三角逆：X[i,:]=-sum(k<i,L[i,k]*X[k,:])，X[i,i]=1。
+            // 系数靠 Gather 每次只取一列，偏移张量与 k 无关，只随行号变化：
+            // offsets[i] = 256 * (i / 32 + 1) 字节，用 4 条矢量指令生成本次调用的
+            // 偏移表（Leaf0 区在 V3 内空闲）；系数区与乘积区放在已消费的
+            // compact raw 低地址。
+            // 每个 dst 行 32 个 lane 共用一个偏移，行数取两个叶里更大的那个。
+            constexpr uint32_t kLeafLanes = 32;
+            const uint32_t coeffCount =
+                (topRows > bottomRows ? topRows : bottomRows) * kLeafLanes;
+            AscendC::CreateVecIndex(coeffOffsetInt, 0, coeffCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::ShiftRight(coeffOffsetInt, coeffOffsetInt, 5, coeffCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(coeffOffsetInt, coeffOffsetInt, 1, coeffCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(coeffOffsetInt, coeffOffsetInt,
+                          static_cast<int32_t>(Shape::kChunkRows * sizeof(float)),
+                          coeffCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            auto coeffOffset = coeffOffsetInt.template ReinterpretCast<uint32_t>();
+            SolveLeavesRightLooking(x0, x1, lkk, coeffOffset, raw, negX1,
+                                    topRows, bottomRows, Shape::kChunkRows);
         }
-        const uint32_t bottomDiagonalLanes =
-            bottomRows < kFp32PerBlock ? bottomRows : kFp32PerBlock;
-        for (uint32_t lane = 0; lane < bottomDiagonalLanes; ++lane) {
-            uint64_t diagonalMask[2] = {1ULL << lane, 0};
-            const uint8_t repeat = static_cast<uint8_t>(
-                CeilDiv(bottomRows - lane, kFp32PerBlock));
-            AscendC::Duplicate(x1[lane * 32], 1.0F, diagonalMask, repeat,
-                               kDiagonalBlockStride, kDiagonalRepeatStride);
-        }
-        AscendC::PipeBarrier<PIPE_V>();
-        // 单位下三角逆：X[i,:]=-sum(k<i,L[i,k]*X[k,:])，X[i,i]=1。
-        // 系数靠 Gather 每次只取一列，偏移张量与 k 无关，只随行号变化：
-        // offsets[i] = 256 * (i / 32 + 1) 字节，用 4 条矢量指令生成本次调用的
-        // 偏移表（Leaf0 区在 V3 内空闲）；系数区与乘积区放在已消费的
-        // compact raw 低地址。
-        // 每个 dst 行 32 个 lane 共用一个偏移，行数取两个叶里更大的那个。
-        constexpr uint32_t kLeafLanes = 32;
-        const uint32_t coeffCount =
-            (topRows > bottomRows ? topRows : bottomRows) * kLeafLanes;
-        AscendC::CreateVecIndex(coeffOffsetInt, 0, coeffCount);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::ShiftRight(coeffOffsetInt, coeffOffsetInt, 5, coeffCount);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Adds(coeffOffsetInt, coeffOffsetInt, 1, coeffCount);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(coeffOffsetInt, coeffOffsetInt,
-                      static_cast<int32_t>(Shape::kChunkRows * sizeof(float)),
-                      coeffCount);
-        AscendC::PipeBarrier<PIPE_V>();
-        auto coeffOffset = coeffOffsetInt.template ReinterpretCast<uint32_t>();
-        auto coeffTile = raw;
-        auto prodTile = raw[2048];
-        SolveLeafRightLooking(x0, lkk, coeffOffset, coeffTile, prodTile,
-                              topRows, 0, Shape::kChunkRows);
-        SolveLeafRightLooking(x1, lkk, coeffOffset, coeffTile, prodTile,
-                              bottomRows, 32 * Shape::kChunkRows + 32,
-                              Shape::kChunkRows);
         // B 已在解包 rawAkk 时直接写入；其余行保持零。
         AscendC::PipeBarrier<PIPE_V>();
+        // For a full chunk, the packed solve leaves both output matrices in
+        // the dead Gather-offset region. The tail path retains x0/x1.
+        auto leaf0 = validRows == Shape::kChunkRows
+            ? coeffOffsetInt.template ReinterpretCast<float>() : x0;
+        auto leaf1 = validRows == Shape::kChunkRows ? leaf0[1024] : x1;
         // C5 直接执行普通 MMAD：negX1@T，不依赖不存在的 negate 参数。
-        AscendC::Muls(negX1, x1, -1.0F, 1024);
+        AscendC::Muls(negX1, leaf1, -1.0F, 1024);
         AscendC::PipeBarrier<PIPE_V>();
 
         // q00=X0、q01=0、q11=X1；q10 留给 C5 的 negX1@T。
         AscendC::Duplicate(akkPack, static_cast<bfloat16_t>(0), 4096);
         AscendC::PipeBarrier<PIPE_V>();
-        for (uint32_t row = 0; row < topRows; ++row) {
-            AscendC::Cast(akkPack[row * Shape::kChunkRows],
-                          x0[row * 32], AscendC::RoundMode::CAST_RINT, 32);
-            AscendC::PipeBarrier<PIPE_V>();
+        if (topRows > 0) {
+            AscendC::Cast(akkPack, leaf0, AscendC::RoundMode::CAST_RINT, uint64_t(32), static_cast<uint8_t>(topRows), {1, 1, 4, 4});
         }
-        for (uint32_t row = 0; row < bottomRows; ++row) {
-            AscendC::Cast(
-                akkPack[(row + 32) * Shape::kChunkRows + 32],
-                x1[row * 32], AscendC::RoundMode::CAST_RINT, 32);
-            AscendC::PipeBarrier<PIPE_V>();
+        if (bottomRows > 0) {
+            AscendC::Cast(akkPack[32 * Shape::kChunkRows + 32], leaf1, AscendC::RoundMode::CAST_RINT, uint64_t(32), static_cast<uint8_t>(bottomRows), {1, 1, 4, 4});
         }
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void V6Vf(
@@ -1250,79 +1404,87 @@ private:
             Domain::StoredBound(ExpDomain::kV6UpperBase2);
         // 同样的公式按整块（8 行）下发，逐行只影响行列步长参数，
         // 数学与舍入顺序与逐行版本完全一致。
-        // 与 V1 相同：共享 scratch 前 7 KiB 可用（0x1F00 起是 beta gather
-        // 偏移表），因此每块 7 行 FP32。
-        constexpr uint32_t kTileRows = 7;
+        // 与 V1 相同：每块使用 8 行 FP32 scratch；beta gather 偏移
+        // 在独立私有区按需重建。
+        constexpr uint32_t kTileRows = 8;
         constexpr uint32_t kTileElems = kTileRows * Shape::kHeadDim;
         auto factor = scratch;
         auto stage = scratch[kTileElems];
-        for (uint32_t rowBegin = 0; rowBegin < validRows;
-             rowBegin += kTileRows) {
-            const uint32_t rows = validRows - rowBegin < kTileRows
-                                      ? validRows - rowBegin
-                                      : kTileRows;
+        for (uint32_t rowBegin = 0; rowBegin < validRows;) {
+            // Full chunks only: once at least 32 G rows are consumed,
+            // borrow the current qgScaled destination for FP32 factor.
+            // Its last V read precedes the BF16 overwrite below.
+            const bool useWideTile = validRows == Shape::kChunkRows &&
+                rowBegin >= 32;
+            const uint32_t rows = useWideTile ? 16U :
+                (validRows - rowBegin < kTileRows
+                     ? validRows - rowBegin : kTileRows);
+            auto factorTile = useWideTile
+                ? g[rowBegin * Shape::kHeadDim / 2] : factor;
+            auto stageTile = useWideTile ? scratch : stage;
             const uint32_t elems = rows * Shape::kHeadDim;
             const uint32_t offset = rowBegin * Shape::kHeadDim;
             // E(G)=exp(clamp(g[row]))：这里刻意不减 g[last]，与 arch35 的
             // V6 语义（qg/qBeta 用行内累计量，kg 才用 g[last]-g[row]）一致。
-            AscendC::Maxs(factor, g[offset], directMin, elems);
+            AscendC::Maxs(factorTile, g[offset], directMin, elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mins(factor, factor, directMax, elems);
+            AscendC::Mins(factorTile, factorTile, directMax, elems);
             AscendC::PipeBarrier<PIPE_V>();
             if constexpr (Domain::useExp2) {
-                AscendC::Muls(factor, factor, Domain::expInputScale, elems);
+                AscendC::Muls(factorTile, factorTile, Domain::expInputScale, elems);
                 AscendC::PipeBarrier<PIPE_V>();
             }
-            AscendC::Exp(factor, factor, elems);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(stage, qg[offset], AscendC::RoundMode::CAST_NONE,
+            AscendC::Exp(factorTile, factorTile, elems);
+            AscendC::Cast(stageTile, qg[offset], AscendC::RoundMode::CAST_NONE,
                           elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mul(stage, stage, factor, elems);
+            AscendC::Mul(stageTile, stageTile, factorTile, elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(qg[offset], stage, AscendC::RoundMode::CAST_RINT,
+            AscendC::Cast(qg[offset], stageTile, AscendC::RoundMode::CAST_RINT,
                           elems);
             AscendC::PipeBarrier<PIPE_V>();
             // 第一次舍入：Khat*E(G) 先写入 kBetaG 的 BF16 存储。
-            AscendC::Cast(stage, kg[offset], AscendC::RoundMode::CAST_NONE,
+            AscendC::Cast(stageTile, kg[offset], AscendC::RoundMode::CAST_NONE,
                           elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mul(stage, stage, factor, elems);
+            AscendC::Mul(stageTile, stageTile, factorTile, elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(kBetaG[offset], stage,
+            AscendC::Cast(kBetaG[offset], stageTile,
                           AscendC::RoundMode::CAST_RINT, elems);
-            AscendC::PipeBarrier<PIPE_V>();
+            // Stage is read above while the next subtraction writes factor;
+            // both complete before factor's existing PIPE_V below.
             // E'(G)=exp(clamp(g[last]-g[row]))
-            SubRowMinusTile(factor, g[last], g[offset], rows);
+            SubRowMinusTile(factorTile, g[last], g[offset], rows);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Maxs(factor, factor, directMin, elems);
+            AscendC::Maxs(factorTile, factorTile, directMin, elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mins(factor, factor, directMax, elems);
+            AscendC::Mins(factorTile, factorTile, directMax, elems);
             AscendC::PipeBarrier<PIPE_V>();
             if constexpr (Domain::useExp2) {
-                AscendC::Muls(factor, factor, Domain::expInputScale, elems);
+                AscendC::Muls(factorTile, factorTile, Domain::expInputScale, elems);
                 AscendC::PipeBarrier<PIPE_V>();
             }
-            AscendC::Exp(factor, factor, elems);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(stage, kg[offset], AscendC::RoundMode::CAST_NONE,
+            AscendC::Exp(factorTile, factorTile, elems);
+            AscendC::Cast(stageTile, kg[offset], AscendC::RoundMode::CAST_NONE,
                           elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mul(stage, stage, factor, elems);
+            AscendC::Mul(stageTile, stageTile, factorTile, elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(kg[offset], stage, AscendC::RoundMode::CAST_RINT,
+            AscendC::Cast(kg[offset], stageTile, AscendC::RoundMode::CAST_RINT,
                           elems);
             AscendC::PipeBarrier<PIPE_V>();
             // qgScaled 从已舍入的 BF16 qg 中间量回读。正序处理时，BF16 输出
             // 只覆盖已经消费完的 FP32 G 低地址，不会覆盖后续 G 行。
-            AscendC::Cast(stage, qg[offset], AscendC::RoundMode::CAST_NONE,
+            AscendC::Cast(stageTile, qg[offset], AscendC::RoundMode::CAST_NONE,
                           elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(stage, stage, scale, elems);
+            AscendC::Muls(stageTile, stageTile, scale, elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(qgScaled[offset], stage,
+            AscendC::Cast(qgScaled[offset], stageTile,
                           AscendC::RoundMode::CAST_RINT, elems);
-            AscendC::PipeBarrier<PIPE_V>();
+            // The next Maxs (or the following beta Brcb) uses disjoint
+            // addresses; its existing PIPE_V completes this Cast as well.
+            rowBegin += rows;
         }
         // 逐行 beta 缩放：betaEff 先 Brcb 展开成“每行 1 个 32B block”，
         // 再用两条整块 Mul（低/高半行）完成 betaEff*round(Khat*E(G)) 与
@@ -1335,31 +1497,42 @@ private:
         // 每块再把“每行 1 个 block”复制成“每行 8 个 block”，供 fp32 的
         // 64 lane repeat 使用（dataBlockStride 不支持 0）。
         auto betaRepeat = g[validRows * Shape::kHeadDim / 2 + 512];
+        // qg is only an output in Save mode. For full chunks in other
+        // modes its last read ended in the preceding vector loop.
+        // Borrow the private 16 KiB qg region for the FP32 stage.
+        auto betaStage = stage;
+        uint32_t betaTileRows = kTileRows;
+        if constexpr (CompilePolicy::outputMode != OutputMode::Save) {
+            if (validRows == Shape::kChunkRows) {
+                betaStage = qg.template ReinterpretCast<float>();
+                betaTileRows = 32;
+            }
+        }
         for (uint32_t rowBegin = 0; rowBegin < validRows;
-             rowBegin += kTileRows) {
-            const uint32_t rows = validRows - rowBegin < kTileRows
+             rowBegin += betaTileRows) {
+            const uint32_t rows = validRows - rowBegin < betaTileRows
                                       ? validRows - rowBegin
-                                      : kTileRows;
+                                      : betaTileRows;
             const uint32_t elems = rows * Shape::kHeadDim;
             const uint32_t offset = rowBegin * Shape::kHeadDim;
             ReplicateRowScalarsToRepeat(betaRepeat, betaBrcb[8 * rowBegin],
                                         rows);
             AscendC::PipeBarrier<PIPE_V>();
             // 第二次舍入：betaEff*(round(Khat*E(G)))。
-            AscendC::Cast(stage, kBetaG[offset],
+            AscendC::Cast(betaStage, kBetaG[offset],
                           AscendC::RoundMode::CAST_NONE, elems);
             AscendC::PipeBarrier<PIPE_V>();
-            MulTileByRowScalars(stage, stage, betaRepeat, rows);
+            MulTileByRowScalars(betaStage, betaStage, betaRepeat, rows);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(kBetaG[offset], stage,
+            AscendC::Cast(kBetaG[offset], betaStage,
                           AscendC::RoundMode::CAST_RINT, elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(stage, vBeta[offset], AscendC::RoundMode::CAST_NONE,
+            AscendC::Cast(betaStage, vBeta[offset], AscendC::RoundMode::CAST_NONE,
                           elems);
             AscendC::PipeBarrier<PIPE_V>();
-            MulTileByRowScalars(stage, stage, betaRepeat, rows);
+            MulTileByRowScalars(betaStage, betaStage, betaRepeat, rows);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(vBeta[offset], stage,
+            AscendC::Cast(vBeta[offset], betaStage,
                           AscendC::RoundMode::CAST_RINT, elems);
             AscendC::PipeBarrier<PIPE_V>();
         }

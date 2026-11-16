@@ -41,6 +41,8 @@ public:
         // 分配器的预期返回值直接列在申请现场，便于逐项核对。
         mte2ToMte1_ = pipe_->AllocEventID<AscendC::HardEvent::MTE2_MTE1>(); // ID 0
         mte1ToM_ = pipe_->AllocEventID<AscendC::HardEvent::MTE1_M>(); // ID 0
+        // Protect C7 L1 readers before the next group reuses a head lane.
+        mte1ToMte2_ = pipe_->AllocEventID<AscendC::HardEvent::MTE1_MTE2>();
         // AIC 的 TPipe::Init 已在 M_MTE1 池占用 0、1、2。
         mToMte1_ = pipe_->AllocEventID<AscendC::HardEvent::M_MTE1>(); // ID 3
         mToFix_ = pipe_->AllocEventID<AscendC::HardEvent::M_FIX>(); // ID 0
@@ -106,10 +108,23 @@ public:
                 for (uint32_t pair = 0; pair < 2; ++pair) {
                     AscendC::CrossCoreWaitFlag<0x2, PIPE_MTE2>(
                         kReadyFlagId[pair]);
+                    // Independent L1 lanes permit loading the next head while
+                    // the first head's score GEMMs are in flight.  tReady is
+                    // consumed here before its later C4/C5 use.
                     for (uint32_t headInPair = 0; headInPair < 2; ++headInPair) {
                         const uint32_t localHead = pair * 2 + headInPair;
                         if (localHead < activeHeads) {
-                            StageC2(chunk, localHead);
+                            StageC2Load(localHead);
+                            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(
+                                tReady_[localHead]);
+                        }
+                    }
+                    for (uint32_t headInPair = 0; headInPair < 2; ++headInPair) {
+                        const uint32_t localHead = pair * 2 + headInPair;
+                        if (localHead < activeHeads) {
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(
+                                tReady_[localHead]);
+                            StageC2Compute(chunk, localHead);
                         }
                     }
                     AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(
@@ -151,6 +166,11 @@ public:
                     StageC7(chunk, groupBegin, activeHeads, pair,
                             kFreeFlagId[pair]);
                 }
+                // StageC7 enqueues its last L1 reads on MTE1. The next
+                // group's StageC2 writes the same head lanes on MTE2; order
+                // that reuse after every C7 read for this group has finished.
+                AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(mte1ToMte2_);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(mte1ToMte2_);
                 groupBegin += activeHeads;
             }
         }
@@ -166,8 +186,7 @@ private:
         return count > Shape::kSubChunkCount ? Shape::kSubChunkCount : count;
     }
 
-    __aicore__ inline void StageC2(const ChunkRange &chunk,
-                                   uint32_t localHead)
+    __aicore__ inline void StageC2Load(uint32_t localHead)
     {
         const uint64_t slot = WorkspaceSlotBase(
             workgroup_, localHead, Workspace::kArch22WorkgroupStride,
@@ -177,10 +196,6 @@ private:
             args_.workspace + slot + Workspace::kPayload));
         auto l1Bytes = l1Buf_.Get<uint8_t>();
         auto scoreL1 = l1Bytes[L1::kHeadLane[localHead]].template ReinterpretCast<bfloat16_t>();
-        auto l0A = l0ABuf_.Get<bfloat16_t>();
-        auto l0B = l0BBuf_.Get<bfloat16_t>();
-        auto l0C = l0CBuf_.Get<float>();
-
         // 每个源矩阵只搬一次；MTE2 在搬运时把 ND 转为 L1 NZ。
         AscendC::Nd2NzParams copy{};
         copy.ndNum = 1;
@@ -201,9 +216,19 @@ private:
             AscendC::DataCopy(scoreL1[ScorePayload::kKMinus[s] / sizeof(bfloat16_t)],
                               payload[ScorePayload::kKMinus[s] / sizeof(bfloat16_t)], copy);
         }
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(mte2ToMte1_);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(mte2ToMte1_);
+    }
 
+    __aicore__ inline void StageC2Compute(const ChunkRange &chunk,
+                                          uint32_t localHead)
+    {
+        const uint64_t slot = WorkspaceSlotBase(
+            workgroup_, localHead, Workspace::kArch22WorkgroupStride,
+            Workspace::kArch22SlotStride);
+        auto l1Bytes = l1Buf_.Get<uint8_t>();
+        auto scoreL1 = l1Bytes[L1::kHeadLane[localHead]].template ReinterpretCast<bfloat16_t>();
+        auto l0A = l0ABuf_.Get<bfloat16_t>();
+        auto l0B = l0BBuf_.Get<bfloat16_t>();
+        auto l0C = l0CBuf_.Get<float>();
         const uint32_t active = ActiveSubChunks(chunk.validRows);
         AscendC::GlobalTensor<float> rawScoreRelay;
         rawScoreRelay.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(
@@ -707,6 +732,7 @@ private:
     {
         pipe_->ReleaseEventID<AscendC::HardEvent::MTE2_MTE1>(mte2ToMte1_);
         pipe_->ReleaseEventID<AscendC::HardEvent::MTE1_M>(mte1ToM_);
+        pipe_->ReleaseEventID<AscendC::HardEvent::MTE1_MTE2>(mte1ToMte2_);
         pipe_->ReleaseEventID<AscendC::HardEvent::M_MTE1>(mToMte1_);
         pipe_->ReleaseEventID<AscendC::HardEvent::M_FIX>(mToFix_);
         pipe_->ReleaseEventID<AscendC::HardEvent::FIX_M>(fixToM_);
@@ -727,6 +753,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::CO1> l0CBuf_{};
     AscendC::TEventID mte2ToMte1_{};
     AscendC::TEventID mte1ToM_{};
+    AscendC::TEventID mte1ToMte2_{};
     AscendC::TEventID mToMte1_{};
     AscendC::TEventID mToFix_{};
     AscendC::TEventID fixToM_{};

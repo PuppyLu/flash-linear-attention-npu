@@ -88,7 +88,7 @@ public:
         const uint32_t end = WorkEnd(total, core_, args_.tiling.usedCoreNum);
         // 主体只分 chunk；余下不足一轮核数的 chunk 才按 4-head 组均摊。
         const uint32_t cores = args_.tiling.usedCoreNum;
-        const bool balanceTail = kFinalizeA5 && !args_.tiling.isVarLen &&
+        const bool balanceTail = (!kFinalizeA5 || !args_.tiling.isVarLen) &&
             partitions == 1 && total >= cores && total % cores != 0;
         const uint32_t fullChunksPerCore = total / cores;
         const uint32_t headGroups = CeilDiv(args_.tiling.valueHeadNum, Shape::kHeadsPerGroup);
@@ -147,6 +147,11 @@ public:
             }
 #endif
         } else {
+            for (uint32_t slot = 0; slot < Shape::kHeadsPerGroup; ++slot) {
+                if (l1InputInFlight_[slot]) {
+                    WaitFlag<HardEvent::MTE1_MTE2>(slot);
+                }
+            }
             for (uint32_t plane = 0; plane < 2; ++plane) {
                 if (l0OperandInFlight_[plane]) {
                     WaitFlag<HardEvent::M_MTE1>(plane);
@@ -245,10 +250,9 @@ private:
         Mutex::Unlock<PIPE_MTE1>(static_cast<uint8_t>(4 + operandPlane));
         Mutex::Lock<PIPE_M>(static_cast<uint8_t>(4 + operandPlane));
 #else
-        SetFlag<HardEvent::MTE1_M>(0);
-        WaitFlag<HardEvent::MTE1_M>(0);
-        SetFlag<HardEvent::MTE1_MTE2>(0);
-        WaitFlag<HardEvent::MTE1_MTE2>(0);
+        // Each operand plane owns its ready event until MMAD has consumed it.
+        SetFlag<HardEvent::MTE1_M>(operandPlane);
+        WaitFlag<HardEvent::MTE1_M>(operandPlane);
 #endif
         auto tileL0C = GetTile(tensorL0C, tla::MakeCoord(0, 0), tla::MakeShape(m, n));
         // A2/A3 的 MMAD 至少处理一个 16 行分形，尾块仍只写回有效行。
@@ -301,6 +305,13 @@ private:
             const uint64_t hOffset = StateOffset(args_, chunk, head);
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
             Mutex::Lock<PIPE_MTE2>(0);
+#else
+            // Delay L1 slot reuse until both prior QH and AV operands have
+            // left L1. Other head slots can be loaded while MTE1 is active.
+            if (l1InputInFlight_[localHead]) {
+                WaitFlag<HardEvent::MTE1_MTE2>(localHead);
+                l1InputInFlight_[localHead] = false;
+            }
 #endif
             LoadOperands<TileCopyQH, HLayout>(
                 q_, h_, qOffset, hOffset, lane + kQOffset, lane + kHOffset,
@@ -314,8 +325,10 @@ private:
             Mutex::Unlock<PIPE_MTE2>(0);
             Mutex::Lock<PIPE_MTE1>(0);
 #else
-            SetFlag<HardEvent::MTE2_MTE1>(0);
-            WaitFlag<HardEvent::MTE2_MTE1>(0);
+            // Per-slot ID cannot be set again until the MTE1->MTE2 slot
+            // return event has ensured this wait was consumed.
+            SetFlag<HardEvent::MTE2_MTE1>(localHead);
+            WaitFlag<HardEvent::MTE2_MTE1>(localHead);
             if (l0OutputInFlight_[outputSlot]) {
                 WaitFlag<HardEvent::FIX_M>(outputSlot);
                 l0OutputInFlight_[outputSlot] = false;
@@ -356,6 +369,10 @@ private:
         }
         Mutex::Unlock<PIPE_M>(static_cast<uint8_t>(kL0CMutexBase + outputSlot));
 #else
+        // AV is the final L1 read for this slot. MTE2 can recycle it after
+        // this event; the next distinct slot does not need to wait.
+        SetFlag<HardEvent::MTE1_MTE2>(localHead);
+        l1InputInFlight_[localHead] = true;
         SetFlag<HardEvent::M_FIX>(outputSlot);
 #endif
         StoreOutput(chunk, head, outputSlot);
@@ -363,6 +380,7 @@ private:
 
     FinalizeArgs args_{};
     uint32_t core_ = 0;
+    bool l1InputInFlight_[Shape::kHeadsPerGroup] = {};
     bool l0OperandInFlight_[2] = {false, false};
     bool l0OutputInFlight_[2] = {false, false};
     GlobalTensor<Element> q_;

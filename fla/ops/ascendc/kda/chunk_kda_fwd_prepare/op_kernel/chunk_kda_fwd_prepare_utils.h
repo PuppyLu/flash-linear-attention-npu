@@ -55,10 +55,9 @@ __aicore__ inline uint32_t WorkEnd(uint32_t total, uint32_t rank,
 __aicore__ inline bool UseHeadSplit(
     const PrepareRuntimeTiling &tiling)
 {
-    const uint32_t chunkWork = tiling.isVarLen
-                                   ? tiling.totalChunks
-                                   : tiling.batch * tiling.totalChunks;
-    return chunkWork < tiling.usedCoreNum;
+    // Tiling 的分区大小是 host 与 AIC/AIV 共享的唯一解码依据。
+    return tiling.headsPerPartition != 0 &&
+           tiling.headsPerPartition < tiling.valueHeadNum;
 }
 
 __aicore__ inline uint32_t HeadPartitionCount(
@@ -110,10 +109,9 @@ __aicore__ inline void HeadRange(
         tiling.headsPerPartition == 0 ? tiling.valueHeadNum
                                       : tiling.headsPerPartition;
     headBegin = headPartition * headsPerPartition;
-    headEnd = headBegin + headsPerPartition;
-    if (headEnd > tiling.valueHeadNum) {
-        headEnd = tiling.valueHeadNum;
-    }
+    const uint32_t remaining = tiling.valueHeadNum - headBegin;
+    headEnd = headBegin + (remaining < headsPerPartition
+                               ? remaining : headsPerPartition);
 }
 
 __aicore__ inline bool ResolveChunk(const PrepareKernelArgs &args,
