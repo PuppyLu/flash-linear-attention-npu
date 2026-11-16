@@ -1008,8 +1008,8 @@ private:
         constexpr float clampMax = Domain::StoredBound(base2Max);
         // 共享 scratch 8 KiB 切成两块 8 行 FP32：factor 存参考行差值取指后的
         // 指数因子，stage 存 BF16 输入展开的 FP32 落位。
-        // 注意 scratch 末尾 0x1F00 起是 sequence-major 场景的 beta gather
-        // 偏移表，本 Stage 只使用前 7 KiB，因此每块最多 7 行 FP32。
+        // 每块使用 8 行 FP32 scratch；sequence-major 的 beta gather 偏移
+        // 在独立私有区按需重建，不占用这里的 scratch。
         constexpr uint32_t kTileRows = 8;
         constexpr uint32_t kTileElems = kTileRows * Shape::kHeadDim;
         auto factor = scratch;
@@ -1416,8 +1416,8 @@ private:
             Domain::StoredBound(ExpDomain::kV6UpperBase2);
         // 同样的公式按整块（8 行）下发，逐行只影响行列步长参数，
         // 数学与舍入顺序与逐行版本完全一致。
-        // 与 V1 相同：共享 scratch 前 7 KiB 可用（0x1F00 起是 beta gather
-        // 偏移表），因此每块 7 行 FP32。
+        // 与 V1 相同：每块使用 8 行 FP32 scratch；beta gather 偏移
+        // 在独立私有区按需重建。
         constexpr uint32_t kTileRows = 8;
         constexpr uint32_t kTileElems = kTileRows * Shape::kHeadDim;
         auto factor = scratch;
